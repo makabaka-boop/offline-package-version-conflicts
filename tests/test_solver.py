@@ -19,6 +19,8 @@ def brute_force(payload: dict):
         }
         if not is_complete_solution(catalog, candidate):
             continue
+        if not respects_conflicts(catalog, candidate):
+            continue
 
         changed = 0
         for name, version in candidate.items():
@@ -63,14 +65,26 @@ def is_complete_solution(catalog, candidate):
     return reached == set(candidate)
 
 
+def respects_conflicts(catalog, candidate):
+    # A declared pair forbids the two pinned versions from coexisting; pins
+    # whose package is absent from the candidate are vacuously satisfied.
+    for (name_a, version_a), (name_b, version_b) in catalog.conflicts:
+        if candidate.get(name_a) == version_a and candidate.get(name_b) == version_b:
+            return False
+    return True
+
+
 def solve_payload(payload):
     catalog = parse_request(payload)
     result = solve(catalog)
     return None if result is None else dict(sorted(result.items()))
 
 
-def payload_from_generated(packages, root, installed):
-    return {"packages": packages, "root": root, "installed": installed}
+def payload_from_generated(packages, root, installed, conflicts=None):
+    payload = {"packages": packages, "root": root, "installed": installed}
+    if conflicts is not None:
+        payload["conflicts"] = conflicts
+    return payload
 
 
 def make_random_payload(seed: int, package_count: int, max_versions: int) -> dict:
@@ -111,7 +125,24 @@ def make_random_payload(seed: int, package_count: int, max_versions: int) -> dic
             # Include versions absent from the catalog to test stale installs.
             installed[name] = rng.randint(1, max_versions + 1)
 
-    return payload_from_generated(packages, root, installed)
+    conflicts = []
+    seen_pairs = set()
+    for _ in range(rng.randint(0, 3)):
+        name_a, name_b = rng.sample(names, 2)
+        version_a = int(rng.choice(list(packages[name_a])))
+        version_b = int(rng.choice(list(packages[name_b])))
+        pair = tuple(sorted(((name_a, version_a), (name_b, version_b))))
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        conflicts.append(
+            [
+                {"package": pair[0][0], "version": pair[0][1]},
+                {"package": pair[1][0], "version": pair[1][1]},
+            ]
+        )
+
+    return payload_from_generated(packages, root, installed, conflicts)
 
 
 @pytest.mark.parametrize("seed", range(60))
@@ -291,3 +322,140 @@ def test_empty_root_is_a_valid_empty_closure_and_removes_everything():
         "installed": {"a": 1},
     }
     assert solve_payload(payload) == {}
+
+
+def test_conflict_excludes_only_the_pinned_version_combination():
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {},
+        "conflicts": [[{"package": "a", "version": 2}, {"package": "b", "version": 2}]],
+    }
+    # (2, 2) is forbidden; among the rest the maximal vector is (2, 1).
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_conflict_can_make_root_unresolvable():
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[{"package": "a", "version": 1}, {"package": "b", "version": 1}]],
+    }
+    assert solve_payload(payload) is None
+
+
+def test_conflict_does_not_create_a_dependency():
+    # b is only mentioned by a conflict; it must not be pulled into the
+    # closure, and the conflict is vacuous while b is absent.
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 2]},
+        "installed": {},
+        "conflicts": [[{"package": "a", "version": 1}, {"package": "b", "version": 1}]],
+    }
+    assert solve_payload(payload) == {"a": 2}
+
+
+def test_conflict_does_not_allow_keeping_packages_outside_closure():
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1]},
+        "installed": {"a": 1, "b": 1},
+        "conflicts": [[{"package": "a", "version": 1}, {"package": "b", "version": 1}]],
+    }
+    # b is unreachable from the root, so it must be removed; the conflict
+    # cannot be used to justify retaining it.
+    assert solve_payload(payload) == {"a": 1}
+
+
+def test_conflict_resolution_prefers_fewest_changes_then_max_vector():
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {"a": 2, "b": 2},
+        "conflicts": [[{"package": "a", "version": 2}, {"package": "b", "version": 2}]],
+    }
+    # Keeping both installed pins is illegal.  The one-change options are
+    # (a=1, b=2) and (a=2, b=1); the version vector picks the latter.
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_conflict_is_checked_while_propagating_dependencies():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 2]}},
+                "2": {"dependencies": {"b": [2, 2]}},
+            },
+            "b": {"1": {}, "2": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 2], "c": [1, 1]},
+        "installed": {},
+        "conflicts": [[{"package": "b", "version": 2}, {"package": "c", "version": 1}]],
+    }
+    # a=2 forces b=2, which clashes with the required c=1; the solver must
+    # backtrack to a=1 and then avoid b=2 as well.
+    assert solve_payload(payload) == {"a": 1, "b": 1, "c": 1}
+
+
+def test_conflict_inside_dependency_cycle():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 2]}},
+                "2": {"dependencies": {"b": [1, 1]}},
+            },
+            "b": {
+                "1": {"dependencies": {"a": [1, 2]}},
+                "2": {"dependencies": {"a": [1, 2]}},
+            },
+        },
+        "root": {"a": [1, 2]},
+        "installed": {},
+        "conflicts": [[{"package": "a", "version": 2}, {"package": "b", "version": 1}]],
+    }
+    # a=2 can only pair with b=1, which is exactly the forbidden combination.
+    assert solve_payload(payload) == {"a": 1, "b": 2}
+
+
+def test_conflict_with_stale_installed_version():
+    payload = {
+        "packages": {"a": {"2": {}, "3": {}}, "b": {"1": {}}},
+        "root": {"a": [2, 3], "b": [1, 1]},
+        "installed": {"a": 1, "b": 1},
+        "conflicts": [[{"package": "a", "version": 3}, {"package": "b", "version": 1}]],
+    }
+    # Installed a=1 is stale, so any plan costs a change; a=3 conflicts with
+    # the required b=1, leaving a=2 despite its smaller vector.
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_conflict_can_force_the_smaller_closure():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"x": [1, 1]}},
+                "2": {},
+            },
+            "x": {"1": {}},
+            "b": {"1": {}},
+        },
+        "root": {"a": [1, 2], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[{"package": "x", "version": 1}, {"package": "b", "version": 1}]],
+    }
+    # a=1 would pull x=1, which conflicts with the required b=1.
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_omitted_conflicts_behaves_like_empty_conflicts():
+    base = {
+        "packages": {"a": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2]},
+        "installed": {"a": 1},
+    }
+    with_empty = dict(base, conflicts=[])
+    # Keeping the installed a=1 costs zero changes and therefore wins.
+    assert solve_payload(base) == solve_payload(with_empty) == {"a": 1}

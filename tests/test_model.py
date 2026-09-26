@@ -134,3 +134,71 @@ def test_reject_duplicate_json_object_keys():
     """
     with pytest.raises(InputError):
         parse_request(raw)
+
+
+def test_conflicts_default_to_empty():
+    catalog = parse_request(json.dumps(valid_payload()))
+    assert catalog.conflicts == ()
+
+
+def test_accepts_empty_conflicts():
+    catalog = parse_request(json.dumps(valid_payload(conflicts=[])))
+    assert catalog.conflicts == ()
+
+
+def test_accepts_valid_conflicts():
+    payload = valid_payload(
+        conflicts=[[{"package": "a", "version": 1}, {"package": "b", "version": 2}]]
+    )
+    catalog = parse_request(json.dumps(payload))
+    assert catalog.conflicts == ((("a", 1), ("b", 2)),)
+
+
+def test_conflicts_are_normalized_and_sorted():
+    payload = valid_payload(
+        conflicts=[
+            [{"package": "b", "version": 2}, {"package": "a", "version": 1}],
+            [{"package": "a", "version": 2}, {"package": "b", "version": 1}],
+        ]
+    )
+    catalog = parse_request(json.dumps(payload))
+    assert catalog.conflicts == ((("a", 1), ("b", 2)), (("a", 2), ("b", 1)))
+
+
+@pytest.mark.parametrize(
+    "conflicts",
+    [
+        None,  # present but null
+        {},  # not an array
+        "a",
+        [[{"package": "a", "version": 1}]],  # single endpoint
+        [  # three endpoints
+            [
+                {"package": "a", "version": 1},
+                {"package": "b", "version": 1},
+                {"package": "a", "version": 2},
+            ]
+        ],
+        [["a", {"package": "b", "version": 1}]],  # endpoint not an object
+        [[{"package": "a"}, {"package": "b", "version": 1}]],  # missing version
+        [[{"version": 1}, {"package": "b", "version": 1}]],  # missing package
+        [[{"package": "a", "version": 1, "extra": 1}, {"package": "b", "version": 1}]],
+        [[{"package": "missing", "version": 1}, {"package": "b", "version": 1}]],
+        [[{"package": "a", "version": 9}, {"package": "b", "version": 1}]],
+        [[{"package": "a", "version": 0}, {"package": "b", "version": 1}]],
+        [[{"package": "a", "version": True}, {"package": "b", "version": 1}]],
+        [[{"package": 1, "version": 1}, {"package": "b", "version": 1}]],
+        [[{"package": "a", "version": 1}, {"package": "a", "version": 2}]],
+        [  # exact duplicate
+            [{"package": "a", "version": 1}, {"package": "b", "version": 1}],
+            [{"package": "a", "version": 1}, {"package": "b", "version": 1}],
+        ],
+        [  # reversed duplicate
+            [{"package": "a", "version": 1}, {"package": "b", "version": 1}],
+            [{"package": "b", "version": 1}, {"package": "a", "version": 1}],
+        ],
+    ],
+)
+def test_reject_invalid_conflicts(conflicts):
+    with pytest.raises(InputError):
+        parse_request(json.dumps(valid_payload(conflicts=conflicts)))

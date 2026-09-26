@@ -14,13 +14,20 @@ def solve(catalog: Catalog) -> Optional[Selection]:
     """Return the best installable selection, or ``None`` if none exists.
 
     A selection is valid when every root is selected, every selected version's
-    dependency interval contains the selected dependency, and no package outside
-    that reachable closure is present.
+    dependency interval contains the selected dependency, no two selected
+    versions form a declared conflict pair, and no package outside that
+    reachable closure is present.
     """
     names = catalog.ordered_names
     versions = {name: catalog.versions[name] for name in names}
     installed = catalog.installed
     deps = catalog.dependencies
+
+    # (name, version) -> every (name, version) pin it may not coexist with.
+    conflict_partners: dict[tuple[str, int], list[tuple[str, int]]] = {}
+    for (name_a, version_a), (name_b, version_b) in catalog.conflicts:
+        conflict_partners.setdefault((name_a, version_a), []).append((name_b, version_b))
+        conflict_partners.setdefault((name_b, version_b), []).append((name_a, version_a))
 
     # name -> closed (lower, upper) bounds accumulated from roots/edges
     bounds: dict[str, tuple[int, int]] = dict(catalog.root)
@@ -34,6 +41,27 @@ def solve(catalog: Catalog) -> Optional[Selection]:
         options = versions[name]
         pos = bisect_right(options, upper) - 1
         return options[pos] if pos >= 0 and options[pos] >= lower else 0
+
+    def conflicts_with_selection(name: str, version: int) -> bool:
+        for other, other_version in conflict_partners.get((name, version), ()):
+            if selected.get(other) == other_version:
+                return True
+        return False
+
+    def pending_has_conflict_free_version() -> bool:
+        # Necessary condition for any descendant solution: every required but
+        # not yet selected package keeps an in-bounds version that does not
+        # conflict with the versions chosen so far.
+        for name, (lower, upper) in bounds.items():
+            if name in selected:
+                continue
+            if not any(
+                lower <= version <= upper
+                and not conflicts_with_selection(name, version)
+                for version in versions[name]
+            ):
+                return False
+        return True
 
     def forced_change_lower_bound() -> int:
         """Changes unavoidable for the packages currently required."""
@@ -140,32 +168,40 @@ def solve(catalog: Catalog) -> Optional[Selection]:
 
             selected[name] = version
             undo: list[tuple[str, Optional[tuple[int, int]]]] = []
-            consistent = True
+            # Conflicts are symmetric, so testing the newest pin against the
+            # current selection covers every pair.
+            consistent = not conflicts_with_selection(name, version)
 
-            for dependency, (dep_lower, dep_upper) in deps[name][version].items():
-                old_bounds = bounds.get(dependency)
-                if old_bounds is None:
-                    next_bounds = (dep_lower, dep_upper)
-                else:
-                    next_bounds = (
-                        max(old_bounds[0], dep_lower),
-                        min(old_bounds[1], dep_upper),
-                    )
+            if consistent:
+                for dependency, (dep_lower, dep_upper) in deps[name][version].items():
+                    old_bounds = bounds.get(dependency)
+                    if old_bounds is None:
+                        next_bounds = (dep_lower, dep_upper)
+                    else:
+                        next_bounds = (
+                            max(old_bounds[0], dep_lower),
+                            min(old_bounds[1], dep_upper),
+                        )
 
-                if next_bounds[0] > next_bounds[1]:
-                    consistent = False
-                elif dependency in selected and not (
-                    next_bounds[0] <= selected[dependency] <= next_bounds[1]
-                ):
-                    consistent = False
+                    if next_bounds[0] > next_bounds[1]:
+                        consistent = False
+                    elif dependency in selected and not (
+                        next_bounds[0] <= selected[dependency] <= next_bounds[1]
+                    ):
+                        consistent = False
 
-                if old_bounds != next_bounds:
-                    undo.append((dependency, old_bounds))
-                    if consistent:
-                        bounds[dependency] = next_bounds
+                    if old_bounds != next_bounds:
+                        undo.append((dependency, old_bounds))
+                        if consistent:
+                            bounds[dependency] = next_bounds
 
-                if not consistent:
-                    break
+                    if not consistent:
+                        break
+
+            if consistent and conflict_partners:
+                # Forward check: a required package that no longer has any
+                # conflict-free in-bounds version dead-ends this branch.
+                consistent = pending_has_conflict_free_version()
 
             if consistent:
                 dfs()

@@ -10,10 +10,16 @@ The accepted request shape is::
         }
       },
       "root": {"name": [">=1", "<=2"]},
-      "installed": {"name": 2}
+      "installed": {"name": 2},
+      "conflicts": [
+        [{"package": "a", "version": 1}, {"package": "b", "version": 2}]
+      ]
     }
 
 Closed intervals are encoded by their inclusive lower and upper bound.
+``conflicts`` is optional; each entry pins two known package versions that
+must never be installed together.  It is a symmetric mutual-exclusion
+constraint only: it creates no dependency and keeps no package installable.
 """
 
 from __future__ import annotations
@@ -27,6 +33,10 @@ from .errors import InputError
 # dependencies[package][version] = {dependency_name: (lower, upper)}
 Dependencies = dict[str, dict[int, dict[str, tuple[int, int]]]]
 
+# A normalized conflict pair: two (package, version) pins, sorted so that
+# endpoint order in the request is not significant.
+Conflict = tuple[tuple[str, int], tuple[str, int]]
+
 
 @dataclass(frozen=True)
 class Catalog:
@@ -34,6 +44,7 @@ class Catalog:
     dependencies: Dependencies
     root: dict[str, tuple[int, int]]
     installed: dict[str, int]
+    conflicts: tuple[Conflict, ...] = ()
 
     @property
     def ordered_names(self) -> tuple[str, ...]:
@@ -68,7 +79,12 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _validate_document(document: Any) -> Catalog:
     if not isinstance(document, dict):
         raise InputError("request must be a JSON object")
-    _expect_exact_keys(document, {"packages", "root", "installed"}, "request")
+    _expect_exact_keys(
+        document,
+        {"packages", "root", "installed"},
+        "request",
+        optional_keys={"conflicts"},
+    )
 
     packages = _require_object(document["packages"], "packages")
     if not packages:
@@ -109,6 +125,8 @@ def _validate_document(document: Any) -> Catalog:
             version, f"installed version for {name!r}"
         )
 
+    conflicts = _validate_conflicts(document.get("conflicts", []))
+
     # Package names and interval values are now known valid.  Do this after the
     # rest of the structural validation so e.g. a malformed interval cannot be
     # hidden by an out-of-catalog dependency error.
@@ -122,11 +140,22 @@ def _validate_document(document: Any) -> Catalog:
                         "the catalog"
                     )
 
+    for pair in conflicts:
+        for name, version in pair:
+            if name not in versions_by_name:
+                raise InputError(f"conflict package {name!r} is outside the catalog")
+            if version not in versions_by_name[name]:
+                raise InputError(
+                    f"conflict version {version} for package {name!r} is outside "
+                    "the catalog"
+                )
+
     return Catalog(
         versions=versions_by_name,
         dependencies=dependencies,
         root=root,
         installed=installed,
+        conflicts=conflicts,
     )
 
 
@@ -176,6 +205,44 @@ def _validate_package(
     return tuple(sorted(numeric_versions)), dependencies
 
 
+def _validate_conflicts(value: Any) -> tuple[Conflict, ...]:
+    if not isinstance(value, list):
+        raise InputError("conflicts must be a JSON array")
+    normalized: list[Conflict] = []
+    seen: set[Conflict] = set()
+    for index, item in enumerate(value):
+        location = f"conflicts entry {index}"
+        if not isinstance(item, list) or len(item) != 2:
+            raise InputError(
+                f"{location} must be a two-element [endpoint, endpoint] array"
+            )
+        endpoints = tuple(
+            _validate_conflict_endpoint(endpoint, location) for endpoint in item
+        )
+        if endpoints[0][0] == endpoints[1][0]:
+            raise InputError(f"{location} must name two different packages")
+        pair = tuple(sorted(endpoints))
+        if pair in seen:
+            raise InputError(
+                f"{location} duplicates an earlier conflict "
+                "(endpoint order is not significant)"
+            )
+        seen.add(pair)
+        normalized.append(pair)
+    return tuple(sorted(normalized))
+
+
+def _validate_conflict_endpoint(value: Any, location: str) -> tuple[str, int]:
+    endpoint = _require_object(value, f"{location} endpoint")
+    _expect_exact_keys(endpoint, {"package", "version"}, f"{location} endpoint")
+    name = endpoint["package"]
+    _validate_package_name(name)
+    version = _validate_positive_version(
+        endpoint["version"], f"version of {location} endpoint"
+    )
+    return name, version
+
+
 def _validate_package_name(value: Any) -> None:
     if not isinstance(value, str):
         raise InputError(f"package name {value!r} must be a string")
@@ -219,11 +286,15 @@ def _require_object(value: Any, location: str) -> dict[str, Any]:
 
 
 def _expect_exact_keys(
-    value: dict[str, Any], expected: set[str], location: str, optional: bool = False
+    value: dict[str, Any],
+    expected: set[str],
+    location: str,
+    optional: bool = False,
+    optional_keys: set[str] | None = None,
 ) -> None:
     actual = set(value)
     missing = expected - actual
-    unknown = actual - expected
+    unknown = actual - expected - (optional_keys or set())
     if missing and not optional:
         raise InputError(f"{location} is missing key(s): {', '.join(sorted(missing))}")
     if unknown:
