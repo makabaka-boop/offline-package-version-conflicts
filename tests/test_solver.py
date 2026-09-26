@@ -60,7 +60,13 @@ def is_complete_solution(catalog, candidate):
             if dep_actual is None or not dep_lower <= dep_actual <= dep_upper:
                 return False
             stack.append(dependency)
-    return reached == set(candidate)
+    if reached != set(candidate):
+        return False
+    # Mutual exclusion: a declared conflict pair must not be installed together.
+    for (name_a, version_a), (name_b, version_b) in catalog.conflicts:
+        if candidate.get(name_a) == version_a and candidate.get(name_b) == version_b:
+            return False
+    return True
 
 
 def solve_payload(payload):
@@ -69,16 +75,23 @@ def solve_payload(payload):
     return None if result is None else dict(sorted(result.items()))
 
 
-def payload_from_generated(packages, root, installed):
-    return {"packages": packages, "root": root, "installed": installed}
+def payload_from_generated(packages, root, installed, conflicts=None):
+    payload = {"packages": packages, "root": root, "installed": installed}
+    if conflicts is not None:
+        payload["conflicts"] = conflicts
+    return payload
 
 
-def make_random_payload(seed: int, package_count: int, max_versions: int) -> dict:
+def make_random_payload(
+    seed: int, package_count: int, max_versions: int, conflict_count: int = 0
+) -> dict:
     rng = random.Random(seed)
     names = [f"p{i}" for i in range(package_count)]
     packages = {}
+    catalog_versions = {}
     for name in names:
         versions = list(range(1, rng.randint(1, max_versions) + 1))
+        catalog_versions[name] = versions
         package = {}
         for version in versions:
             deps = {}
@@ -111,7 +124,23 @@ def make_random_payload(seed: int, package_count: int, max_versions: int) -> dic
             # Include versions absent from the catalog to test stale installs.
             installed[name] = rng.randint(1, max_versions + 1)
 
-    return payload_from_generated(packages, root, installed)
+    conflicts = None
+    if conflict_count and len(names) >= 2:
+        conflicts = []
+        seen = set()
+        attempts = 0
+        while len(conflicts) < conflict_count and attempts < 200:
+            attempts += 1
+            name_a, name_b = rng.sample(names, 2)
+            version_a = rng.choice(catalog_versions[name_a])
+            version_b = rng.choice(catalog_versions[name_b])
+            key = frozenset({(name_a, version_a), (name_b, version_b)})
+            if key in seen:
+                continue
+            seen.add(key)
+            conflicts.append([[name_a, version_a], [name_b, version_b]])
+
+    return payload_from_generated(packages, root, installed, conflicts)
 
 
 @pytest.mark.parametrize("seed", range(60))
@@ -126,6 +155,26 @@ def test_small_random_catalogs_match_full_enumeration(seed):
 def test_medium_random_catalogs_match_full_enumeration(seed):
     # Five packages with up to four versions gives at most 5**5 = 3125 vectors.
     payload = make_random_payload(seed + 1000, package_count=5, max_versions=4)
+    expected = brute_force(payload)
+    actual = solve_payload(payload)
+    assert actual == (None if expected is None else dict(sorted(expected.items())))
+
+
+@pytest.mark.parametrize("seed", range(60))
+def test_small_random_catalogs_with_conflicts_match_full_enumeration(seed):
+    payload = make_random_payload(
+        seed + 2000, package_count=3, max_versions=3, conflict_count=3
+    )
+    expected = brute_force(payload)
+    actual = solve_payload(payload)
+    assert actual == (None if expected is None else dict(sorted(expected.items())))
+
+
+@pytest.mark.parametrize("seed", range(30))
+def test_medium_random_catalogs_with_conflicts_match_full_enumeration(seed):
+    payload = make_random_payload(
+        seed + 3000, package_count=5, max_versions=4, conflict_count=6
+    )
     expected = brute_force(payload)
     actual = solve_payload(payload)
     assert actual == (None if expected is None else dict(sorted(expected.items())))
@@ -291,3 +340,132 @@ def test_empty_root_is_a_valid_empty_closure_and_removes_everything():
         "installed": {"a": 1},
     }
     assert solve_payload(payload) == {}
+
+
+def test_conflict_forces_backtracking_to_next_best_version():
+    # Without the conflict the optimum is a=2,b=2.  Excluding that exact pair
+    # must not drop b (a root); the solver keeps a=2 and downgrades b instead.
+    payload = {
+        "packages": {
+            "a": {"1": {}, "2": {}},
+            "b": {"1": {}, "2": {}},
+        },
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {},
+        "conflicts": [[["a", 2], ["b", 2]]],
+    }
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_conflict_backtracks_through_dependency_propagation():
+    # a=2 forces b=2, which conflicts with the required c=1; the solver must
+    # unwind that branch and fall back to a=1 (which forces b=1).
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 1]}},
+                "2": {"dependencies": {"b": [2, 2]}},
+            },
+            "b": {"1": {}, "2": {}},
+            "c": {"1": {}},
+        },
+        "root": {"a": [1, 2], "c": [1, 1]},
+        "installed": {},
+        "conflicts": [[["b", 2], ["c", 1]]],
+    }
+    assert solve_payload(payload) == {"a": 1, "b": 1, "c": 1}
+
+
+def test_conflict_with_root_requirements_is_unresolvable():
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 1]]],
+    }
+    assert solve_payload(payload) is None
+
+
+def test_conflicts_can_eliminate_every_version_combination():
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 2], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 1]], [["a", 2], ["b", 1]]],
+    }
+    assert solve_payload(payload) is None
+
+
+def test_conflict_does_not_pull_package_into_closure():
+    # b is only mentioned by the conflict: it stays out of the closure, and an
+    # installed b is removed rather than retained.
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1]},
+        "installed": {"b": 1},
+        "conflicts": [[["a", 1], ["b", 1]]],
+    }
+    assert solve_payload(payload) == {"a": 1}
+
+
+def test_conflict_only_applies_to_the_exact_declared_versions():
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 1], "b": [1, 2]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 1]]],
+    }
+    assert solve_payload(payload) == {"a": 1, "b": 2}
+
+
+def test_conflict_inside_dependency_cycle():
+    payload = {
+        "packages": {
+            "a": {
+                "1": {"dependencies": {"b": [1, 2]}},
+                "2": {"dependencies": {"b": [1, 2]}},
+            },
+            "b": {
+                "1": {"dependencies": {"a": [1, 2]}},
+                "2": {"dependencies": {"a": [1, 2]}},
+            },
+        },
+        "root": {"a": [1, 2]},
+        "installed": {},
+        "conflicts": [[["a", 2], ["b", 2]]],
+    }
+    assert solve_payload(payload) == {"a": 2, "b": 1}
+
+
+def test_conflict_with_stale_installed_version():
+    # Installed a=9 no longer exists in the catalog; the conflict only forbids
+    # (a,2)-(b,1), so the stale install is upgraded to a=2 alongside b=2.
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {"a": 9},
+        "conflicts": [[["a", 2], ["b", 1]]],
+    }
+    assert solve_payload(payload) == {"a": 2, "b": 2}
+
+
+def test_conflict_respects_change_count_before_version_vector():
+    # Keeping the installed (a,1)-(b,2) costs zero changes and is allowed; the
+    # conflict only rules out (a,2)-(b,2), so no upgrade can win.
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {"a": 1, "b": 2},
+        "conflicts": [[["a", 2], ["b", 2]]],
+    }
+    assert solve_payload(payload) == {"a": 1, "b": 2}
+
+
+def test_empty_conflicts_list_behaves_like_omitted_conflicts():
+    base = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {"a": 1},
+    }
+    with_empty = dict(base, conflicts=[])
+    assert solve_payload(with_empty) == solve_payload(base) == {"a": 1, "b": 2}

@@ -14,13 +14,20 @@ def solve(catalog: Catalog) -> Optional[Selection]:
     """Return the best installable selection, or ``None`` if none exists.
 
     A selection is valid when every root is selected, every selected version's
-    dependency interval contains the selected dependency, and no package outside
-    that reachable closure is present.
+    dependency interval contains the selected dependency, no declared conflict
+    pair is installed together, and no package outside that reachable closure
+    is present.
     """
     names = catalog.ordered_names
     versions = {name: catalog.versions[name] for name in names}
     installed = catalog.installed
     deps = catalog.dependencies
+
+    # Bidirectional mutual exclusion between exact (package, version) pairs.
+    conflict_partners: dict[tuple[str, int], set[tuple[str, int]]] = {}
+    for (name_a, version_a), (name_b, version_b) in catalog.conflicts:
+        conflict_partners.setdefault((name_a, version_a), set()).add((name_b, version_b))
+        conflict_partners.setdefault((name_b, version_b), set()).add((name_a, version_a))
 
     # name -> closed (lower, upper) bounds accumulated from roots/edges
     bounds: dict[str, tuple[int, int]] = dict(catalog.root)
@@ -136,6 +143,16 @@ def solve(catalog: Catalog) -> Optional[Selection]:
         # the objective correct regardless of this ordering.
         for version in reversed(versions[name]):
             if not lower <= version <= upper:
+                continue
+
+            partners = conflict_partners.get((name, version))
+            if partners is not None and any(
+                selected.get(other_name) == other_version
+                for other_name, other_version in partners
+            ):
+                # Known-incompatible with an already selected version.  Every
+                # conflicting pair is caught when its second endpoint is
+                # selected, and backtracking undoes the selection as usual.
                 continue
 
             selected[name] = version

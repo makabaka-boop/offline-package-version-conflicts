@@ -58,3 +58,54 @@ def test_cli_rejects_bad_json_with_nonzero_exit(tmp_path):
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr.startswith("error: ")
+
+
+def test_cli_resolves_request_with_conflicts(tmp_path):
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}, "b": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2], "b": [1, 2]},
+        "installed": {},
+        "conflicts": [[["a", 2], ["b", 2]]],
+    }
+    result = run_cli(payload, tmp_path)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert json.loads(result.stdout) == {"a": 2, "b": 1}
+
+
+def test_cli_conflicts_can_force_unresolvable(tmp_path):
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1], "b": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 1]]],
+    }
+    result = run_cli(payload, tmp_path)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "UNRESOLVABLE"
+    assert result.stderr == ""
+
+
+def test_cli_rejects_invalid_conflicts_with_empty_stdout(tmp_path):
+    payload = {
+        "packages": {"a": {"1": {}}, "b": {"1": {}}},
+        "root": {"a": [1, 1]},
+        "installed": {},
+        "conflicts": [[["a", 1], ["b", 9]]],
+    }
+    result = run_cli(payload, tmp_path)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert result.stderr.startswith("error: ")
+
+
+def test_cli_request_without_conflicts_is_byte_compatible(tmp_path):
+    payload = {
+        "packages": {"a": {"1": {}, "2": {}}},
+        "root": {"a": [1, 2]},
+        "installed": {},
+    }
+    result = run_cli(payload, tmp_path)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert result.stdout == '{"a": 2}\n'

@@ -10,15 +10,19 @@ The accepted request shape is::
         }
       },
       "root": {"name": [">=1", "<=2"]},
-      "installed": {"name": 2}
+      "installed": {"name": 2},
+      "conflicts": [[["name_a", 1], ["name_b", 2]]]
     }
 
 Closed intervals are encoded by their inclusive lower and upper bound.
+Each conflict entry pairs the exact versions of two different packages that
+must never be installed together; the constraint is bidirectional and does
+not create any dependency.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from typing import Any
 
@@ -27,6 +31,9 @@ from .errors import InputError
 # dependencies[package][version] = {dependency_name: (lower, upper)}
 Dependencies = dict[str, dict[int, dict[str, tuple[int, int]]]]
 
+# conflicts[i] = ((package_a, version_a), (package_b, version_b))
+Conflicts = tuple[tuple[tuple[str, int], tuple[str, int]], ...]
+
 
 @dataclass(frozen=True)
 class Catalog:
@@ -34,6 +41,7 @@ class Catalog:
     dependencies: Dependencies
     root: dict[str, tuple[int, int]]
     installed: dict[str, int]
+    conflicts: Conflicts = field(default_factory=tuple)
 
     @property
     def ordered_names(self) -> tuple[str, ...]:
@@ -68,7 +76,12 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 def _validate_document(document: Any) -> Catalog:
     if not isinstance(document, dict):
         raise InputError("request must be a JSON object")
-    _expect_exact_keys(document, {"packages", "root", "installed"}, "request")
+    _expect_exact_keys(
+        document,
+        {"packages", "root", "installed"},
+        "request",
+        optional_keys={"conflicts"},
+    )
 
     packages = _require_object(document["packages"], "packages")
     if not packages:
@@ -122,11 +135,14 @@ def _validate_document(document: Any) -> Catalog:
                         "the catalog"
                     )
 
+    conflicts = _validate_conflicts(document.get("conflicts", []), versions_by_name)
+
     return Catalog(
         versions=versions_by_name,
         dependencies=dependencies,
         root=root,
         installed=installed,
+        conflicts=conflicts,
     )
 
 
@@ -176,6 +192,63 @@ def _validate_package(
     return tuple(sorted(numeric_versions)), dependencies
 
 
+def _validate_conflicts(
+    value: Any, versions_by_name: dict[str, tuple[int, ...]]
+) -> Conflicts:
+    if not isinstance(value, list):
+        raise InputError("conflicts must be a JSON array")
+
+    seen: set[frozenset[tuple[str, int]]] = set()
+    conflicts: list[tuple[tuple[str, int], tuple[str, int]]] = []
+    for index, entry in enumerate(value):
+        location = f"conflicts entry {index}"
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise InputError(
+                f"{location} must be a two-element array of [package, version] pairs"
+            )
+
+        pair: list[tuple[str, int]] = []
+        for endpoint in entry:
+            if not isinstance(endpoint, list) or len(endpoint) != 2:
+                raise InputError(
+                    f"{location} endpoints must be [package, version] pairs"
+                )
+            name, version = endpoint
+            _validate_package_name(name)
+            pair.append(
+                (
+                    name,
+                    _validate_positive_version(
+                        version, f"conflict version for {name!r}"
+                    ),
+                )
+            )
+
+        (name_a, version_a), (name_b, version_b) = pair
+        if name_a == name_b:
+            raise InputError(f"{location} must name two different packages")
+        for name, version in pair:
+            if name not in versions_by_name:
+                raise InputError(f"conflict package {name!r} is outside the catalog")
+            if version not in versions_by_name[name]:
+                raise InputError(
+                    f"conflict version {version} for {name!r} is outside the catalog"
+                )
+
+        # The exclusion is symmetric, so an entry and its reverse (or an exact
+        # repeat) describe the same pair and are rejected as duplicates.
+        key = frozenset(pair)
+        if key in seen:
+            raise InputError(
+                f"duplicate conflict between {name_a!r} version {version_a} and "
+                f"{name_b!r} version {version_b}"
+            )
+        seen.add(key)
+        conflicts.append((pair[0], pair[1]))
+
+    return tuple(conflicts)
+
+
 def _validate_package_name(value: Any) -> None:
     if not isinstance(value, str):
         raise InputError(f"package name {value!r} must be a string")
@@ -219,11 +292,15 @@ def _require_object(value: Any, location: str) -> dict[str, Any]:
 
 
 def _expect_exact_keys(
-    value: dict[str, Any], expected: set[str], location: str, optional: bool = False
+    value: dict[str, Any],
+    expected: set[str],
+    location: str,
+    optional: bool = False,
+    optional_keys: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     actual = set(value)
     missing = expected - actual
-    unknown = actual - expected
+    unknown = actual - expected - optional_keys
     if missing and not optional:
         raise InputError(f"{location} is missing key(s): {', '.join(sorted(missing))}")
     if unknown:

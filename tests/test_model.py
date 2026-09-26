@@ -134,3 +134,86 @@ def test_reject_duplicate_json_object_keys():
     """
     with pytest.raises(InputError):
         parse_request(raw)
+
+
+def test_conflicts_default_to_empty_when_omitted():
+    catalog = parse_request(json.dumps(valid_payload()))
+    assert catalog.conflicts == ()
+
+
+def test_accepts_conflicts():
+    payload = valid_payload(conflicts=[[["a", 1], ["b", 2]]])
+    catalog = parse_request(json.dumps(payload))
+    assert catalog.conflicts == ((("a", 1), ("b", 2)),)
+
+
+def test_accepts_empty_conflicts_list():
+    catalog = parse_request(json.dumps(valid_payload(conflicts=[])))
+    assert catalog.conflicts == ()
+
+
+def test_reject_conflicts_that_are_not_a_list():
+    for bad in [{"a": 1}, "a", 1, True]:
+        with pytest.raises(InputError):
+            parse_request(json.dumps(valid_payload(conflicts=bad)))
+
+
+@pytest.mark.parametrize(
+    "conflicts",
+    [
+        [["a", 1, "b", 2]],          # flat four-element entry
+        [[["a", 1]]],                # single endpoint
+        [[["a", 1], ["b", 2], ["b", 1]]],  # three endpoints
+        [[["a", 1], "b"]],           # endpoint is not a pair
+        [[["a", 1], ["b"]]],         # endpoint missing its version
+        [[["a", 1, "x"], ["b", 2]]],  # endpoint with extra element
+    ],
+)
+def test_reject_malformed_conflict_structure(conflicts):
+    with pytest.raises(InputError):
+        parse_request(json.dumps(valid_payload(conflicts=conflicts)))
+
+
+def test_reject_conflict_with_unknown_package():
+    payload = valid_payload(conflicts=[[["a", 1], ["missing", 1]]])
+    with pytest.raises(InputError):
+        parse_request(json.dumps(payload))
+
+
+def test_reject_conflict_with_unknown_version():
+    payload = valid_payload(conflicts=[[["a", 9], ["b", 1]]])
+    with pytest.raises(InputError):
+        parse_request(json.dumps(payload))
+
+
+def test_reject_conflict_between_same_package():
+    for entry in [[["a", 1], ["a", 2]], [["a", 1], ["a", 1]]]:
+        payload = valid_payload(conflicts=[entry])
+        with pytest.raises(InputError):
+            parse_request(json.dumps(payload))
+
+
+def test_reject_reversed_duplicate_conflict():
+    payload = valid_payload(conflicts=[[["a", 1], ["b", 2]], [["b", 2], ["a", 1]]])
+    with pytest.raises(InputError):
+        parse_request(json.dumps(payload))
+
+
+def test_reject_exact_duplicate_conflict():
+    payload = valid_payload(conflicts=[[["a", 1], ["b", 2]], [["a", 1], ["b", 2]]])
+    with pytest.raises(InputError):
+        parse_request(json.dumps(payload))
+
+
+def test_reject_conflict_with_non_positive_or_non_integer_version():
+    for bad_version in [0, -1, True, "1", 1.5]:
+        payload = valid_payload(conflicts=[[["a", bad_version], ["b", 1]]])
+        with pytest.raises(InputError):
+            parse_request(json.dumps(payload))
+
+
+def test_reject_conflict_with_invalid_package_name():
+    for bad_name in ["", "has space", 1]:
+        payload = valid_payload(conflicts=[[[bad_name, 1], ["b", 1]]])
+        with pytest.raises(InputError):
+            parse_request(json.dumps(payload))
